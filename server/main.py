@@ -120,6 +120,43 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockRecommendation(BaseModel):
+    item_id: str
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    location: str
+    quantity_on_hand: int
+    reorder_point: int
+    unit_cost: float
+    deficit: int
+    restock_quantity: int
+    restock_cost: float
+    trend: str
+    forecasted_demand: Optional[int] = None
+    priority_score: float
+    allocated: bool
+    budget_consumed: float
+
+class RestockSummary(BaseModel):
+    total_items_needing_restock: int
+    items_within_budget: int
+    items_excluded: int
+    total_restock_cost: float
+    budget_allocated: float
+    budget_remaining: float
+    budget_utilization_pct: float
+
+class RestockResponse(BaseModel):
+    budget: float
+    warehouse: Optional[str]
+    category: Optional[str]
+    recommendations: List[RestockRecommendation]
+    summary: RestockSummary
+
+TREND_SCORE = {"increasing": 1.0, "stable": 0.5, "decreasing": 0.0, "unknown": 0.3}
+
 # API endpoints
 @app.get("/")
 def root():
@@ -303,6 +340,91 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restock/recommendations", response_model=RestockResponse)
+def get_restock_recommendations(
+    budget: float = 0.0,
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None
+):
+    """Get budget-based restock recommendations ranked by urgency and demand trend"""
+    if budget < 0:
+        raise HTTPException(status_code=400, detail="Budget must be non-negative")
+
+    filtered = apply_filters(inventory_items, warehouse=warehouse, category=category)
+    qualifying = [i for i in filtered if i["quantity_on_hand"] <= i["reorder_point"]]
+
+    demand_map = {f["item_sku"]: f for f in demand_forecasts}
+
+    scored = []
+    for item in qualifying:
+        forecast = demand_map.get(item["sku"])
+        trend = forecast["trend"] if forecast else "unknown"
+        forecasted_demand = forecast["forecasted_demand"] if forecast else None
+        deficit = item["reorder_point"] - item["quantity_on_hand"]
+        deficit_ratio = min(deficit / item["reorder_point"], 1.0) if item["reorder_point"] > 0 else 0.0
+        score = round(0.70 * deficit_ratio + 0.30 * TREND_SCORE[trend], 4)
+        scored.append({
+            **item,
+            "trend": trend,
+            "forecasted_demand": forecasted_demand,
+            "deficit": deficit,
+            "restock_quantity": deficit,
+            "restock_cost": round(deficit * item["unit_cost"], 2),
+            "priority_score": score,
+        })
+
+    scored.sort(key=lambda x: x["priority_score"], reverse=True)
+
+    budget_used = 0.0
+    recommendations = []
+    for item in scored:
+        allocated = (budget_used + item["restock_cost"]) <= budget
+        consumed = round(budget_used + item["restock_cost"], 2) if allocated else round(budget_used, 2)
+        if allocated:
+            budget_used = round(budget_used + item["restock_cost"], 2)
+        recommendations.append(RestockRecommendation(
+            item_id=item["id"],
+            sku=item["sku"],
+            name=item["name"],
+            category=item["category"],
+            warehouse=item["warehouse"],
+            location=item["location"],
+            quantity_on_hand=item["quantity_on_hand"],
+            reorder_point=item["reorder_point"],
+            unit_cost=item["unit_cost"],
+            deficit=item["deficit"],
+            restock_quantity=item["restock_quantity"],
+            restock_cost=item["restock_cost"],
+            trend=item["trend"],
+            forecasted_demand=item["forecasted_demand"],
+            priority_score=item["priority_score"],
+            allocated=allocated,
+            budget_consumed=consumed,
+        ))
+
+    funded = [r for r in recommendations if r.allocated]
+    total_cost = round(sum(r.restock_cost for r in recommendations), 2)
+    allocated_cost = round(sum(r.restock_cost for r in funded), 2)
+    utilization = round((allocated_cost / budget * 100), 1) if budget > 0 else 0.0
+
+    summary = RestockSummary(
+        total_items_needing_restock=len(recommendations),
+        items_within_budget=len(funded),
+        items_excluded=len(recommendations) - len(funded),
+        total_restock_cost=total_cost,
+        budget_allocated=allocated_cost,
+        budget_remaining=round(budget - allocated_cost, 2),
+        budget_utilization_pct=utilization,
+    )
+
+    return RestockResponse(
+        budget=budget,
+        warehouse=warehouse,
+        category=category,
+        recommendations=recommendations,
+        summary=summary,
+    )
 
 if __name__ == "__main__":
     import uvicorn
